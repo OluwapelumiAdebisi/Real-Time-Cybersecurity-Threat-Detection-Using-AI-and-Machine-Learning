@@ -1,0 +1,43 @@
+# Central configuration for the IDS project.
+# Edit paths here once; every script reads from this file.
+
+seed: 42
+
+paths:
+  raw_dir: "data/raw"            # where the original CSE-CIC-IDS2018 CSVs live
+  processed_dir: "data/processed"
+  results_dir: "results"
+  models_dir: "models"
+
+dataset:
+  name: "CSE-CIC-IDS2018"
+  # The label column in CSE-CIC-IDS2018 CSVs is literally "Label".
+  label_column: "Label"
+  # Value that marks normal/benign traffic in the Label column.
+  benign_label: "Benign"
+  # Columns that cause data leakage / artificial accuracy — dropped in preprocessing.
+  # (Exact names vary slightly by CSV; the inspect script reports what's actually present.)
+  leakage_columns:
+    - "Flow ID"
+    - "Src IP"
+    - "Source IP"
+    - "Dst IP"
+    - "Destination IP"
+    - "Src Port"
+    - "Source Port"
+    - "Dst Port"
+    - "Destination Port"
+    - "Timestamp"
+
+sampling:
+  # Start on a manageable subset before scaling up (de-risks GPU/time limits).
+  use_subset: true
+  subset_rows: 200000           # rows sampled across the data for first experiments
+  # Stratify the sample so rare attacks aren't lost.
+  stratify_by_label: true
+
+evaluation:
+  test_size: 0.2
+  # Attack families to hold out entirely from training, to simulate zero-day.
+  # Filled in after the inspect step shows which attack labels exist.
+  zero_day_holdout: []

@@ -1,0 +1,28 @@
+# Data — never commit the datasets (large, and redistribution-restricted)
+data/raw/
+data/processed/
+*.csv
+*.parquet
+
+# Trained models
+models/
+*.h5
+*.keras
+*.pkl
+*.joblib
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Results are kept, but ignore scratch
+results/scratch/
