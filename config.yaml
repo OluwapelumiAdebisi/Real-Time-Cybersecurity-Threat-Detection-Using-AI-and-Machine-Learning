@@ -38,6 +38,17 @@ sampling:
 
 evaluation:
   test_size: 0.2
-  # Attack families to hold out entirely from training, to simulate zero-day.
-  # Filled in after the inspect step shows which attack labels exist.
-  zero_day_holdout: []
+  # Attack families held out entirely from training, to simulate zero-day attacks.
+  # Chosen: the web-attack family — a coherent attack TYPE, genuinely rare
+  # (~928 flows), and subtle, so detecting it unseen is a strong, defensible result.
+  zero_day_holdout:
+    - "SQL Injection"
+    - "Brute Force -XSS"
+    - "Brute Force -Web"
+
+# Rows whose Label equals this are stray repeated header lines (59 found in the
+# raw data) and must be dropped before anything else in preprocessing.
+cleaning:
+  drop_label_values:
+    - "Label"        # repeated header rows
+  drop_duplicates: true   # ~15% of rows are exact duplicates in CSE-CIC-IDS2018
