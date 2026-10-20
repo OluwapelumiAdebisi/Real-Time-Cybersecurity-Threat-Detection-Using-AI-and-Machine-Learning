@@ -1,34 +1,27 @@
 """
 preprocess_data.py  —  Clean, split and scale CSE-CIC-IDS2018 for modelling.
 
-Reads the raw CSVs file-by-file (memory-safe), applies the cleaning decisions
-recorded in config.yaml, carves out the zero-day hold-out, builds a stratified
-working subset, scales features without leakage, and saves everything to
-data/processed/.
+MEMORY-SAFE streaming version: the full 16M-row dataset is NEVER held in memory
+at once. Each CSV is read in chunks; from each chunk we keep (a) all zero-day
+hold-out rows (they're rare) and (b) a random fraction of the rest. Only these
+small kept slices accumulate, so peak memory stays low enough for Kaggle.
 
 Pipeline (in order):
-  1. Read each raw CSV, strip column whitespace.
-  2. Drop stray header rows (Label == "Label").
-  3. Drop leakage-prone columns (Dst Port, Timestamp, ...).
-  4. Coerce features to numeric; clean +/-inf -> NaN -> drop/fill.
-  5. Concatenate, then drop exact-duplicate rows.
-  6. Build labels: family label (original) + binary label (Benign=0, Attack=1).
-  7. Separate the zero-day hold-out families (never seen in training).
-  8. Stratified subsample of the remaining data (for manageable experiments).
-  9. Train/test split (stratified on binary label).
- 10. Scale features: fit scaler on TRAIN ONLY, apply to test + zero-day.
- 11. Save processed arrays/frames + a scaler + a preprocessing report.
-
-Outputs (in data/processed/):
-  X_train.csv, X_test.csv, X_zeroday.csv        (scaled features)
-  y_train.csv, y_test.csv, y_zeroday.csv        (binary + family labels)
-  scaler.joblib                                 (fitted StandardScaler)
-  feature_columns.json                          (final feature order)
-Also writes results/preprocessing_report.txt.
+  1. Pass 1 (cheap): count rows per file to size the sampling fraction.
+  2. Pass 2 (chunked): per chunk -> strip headers, drop leakage cols, coerce
+     numeric, inf->NaN; keep all zero-day rows + a sampled fraction of the rest.
+  3. Concatenate the (small) kept slices.
+  4. Drop exact duplicates; median-impute residual NaNs.
+  5. Labels: family label + binary label (Benign=0, Attack=1).
+  6. Separate zero-day hold-out (web attacks) from main data.
+  7. Train/test split (stratified on binary label).
+  8. Scale: fit StandardScaler on TRAIN ONLY, apply to test + zero-day.
+  9. Save processed CSVs + scaler + feature list + report.
 
 Usage:
-    python preprocess_data.py --raw-dir /kaggle/input/datasets/solarmainframe/ids-intrusion-csv
-    python preprocess_data.py --raw-dir <path> --full      # use ALL rows, no subsample
+  python preprocess_data.py --raw-dir /kaggle/input/datasets/solarmainframe/ids-intrusion-csv
+  python preprocess_data.py --raw-dir <path> --target-rows 200000   # sample size
+  python preprocess_data.py --raw-dir <path> --chunksize 250000      # rows per chunk
 """
 
 import os
@@ -81,33 +74,10 @@ class Tee:
         self.file.close()
 
 
-def clean_one_file(path, label_col, drop_label_values, leakage_cols, log):
-    """Read one CSV and apply per-file cleaning. Returns a cleaned DataFrame."""
-    df = pd.read_csv(path, low_memory=False, encoding="latin-1")
-    df.columns = [c.strip() for c in df.columns]
-    n0 = len(df)
-
-    # Drop stray header rows.
-    if label_col in df.columns:
-        df = df[~df[label_col].astype(str).str.strip().isin(drop_label_values)]
-    n_hdr = n0 - len(df)
-
-    # Drop leakage columns that are present.
-    present_leak = [c for c in df.columns if c in leakage_cols]
-    df = df.drop(columns=present_leak)
-
-    # Separate label, coerce the rest to numeric.
-    labels = df[label_col].astype(str).str.strip()
-    feats = df.drop(columns=[label_col]).apply(pd.to_numeric, errors="coerce")
-
-    # Replace +/- infinity with NaN.
-    feats = feats.replace([np.inf, -np.inf], np.nan)
-
-    out = feats.copy()
-    out[label_col] = labels.values
-    log(f"    {os.path.basename(path):20s} read {n0:>9,}  dropped {n_hdr} header  "
-        f"dropped {len(present_leak)} leak cols  -> {out.shape[1]-1} feats")
-    return out, present_leak
+def count_rows(path):
+    """Fast row count without loading the file into a DataFrame."""
+    with open(path, "r", encoding="latin-1", errors="ignore") as fh:
+        return sum(1 for _ in fh) - 1  # minus header
 
 
 def main():
@@ -115,10 +85,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw-dir", default=None)
     ap.add_argument("--full", action="store_true",
-                    help="Use all rows (no stratified subsample).")
+                    help="Keep all rows (still chunked, but no down-sampling).")
+    ap.add_argument("--target-rows", type=int, default=None,
+                    help="Approx. total rows to keep from the non-zero-day data.")
+    ap.add_argument("--chunksize", type=int, default=250000,
+                    help="Rows per read chunk (lower this if memory is tight).")
     args = ap.parse_args()
 
     seed = cfg.get("seed", 42)
+    rng = np.random.default_rng(seed)
     np.random.seed(seed)
 
     raw_dir = Path(args.raw_dir) if args.raw_dir else ROOT / cfg["paths"]["raw_dir"]
@@ -134,15 +109,15 @@ def main():
     do_dedup = cfg.get("cleaning", {}).get("drop_duplicates", True)
     zero_day = set(cfg["evaluation"].get("zero_day_holdout", []))
     test_size = cfg["evaluation"].get("test_size", 0.2)
-    use_subset = cfg["sampling"].get("use_subset", True) and not args.full
-    subset_rows = cfg["sampling"].get("subset_rows", 200000)
+    target_rows = args.target_rows or cfg["sampling"].get("subset_rows", 200000)
 
     log = Tee(results_dir / "preprocessing_report.txt")
     log("=" * 70)
-    log("CSE-CIC-IDS2018  —  PREPROCESSING REPORT")
+    log("CSE-CIC-IDS2018  —  PREPROCESSING REPORT  (memory-safe streaming)")
     log("=" * 70)
     log(f"Raw dir: {raw_dir}")
-    log(f"Seed: {seed} | subset: {use_subset} ({subset_rows:,} rows) | test_size: {test_size}")
+    log(f"Seed: {seed} | chunksize: {args.chunksize:,} | "
+        f"{'FULL (no downsample)' if args.full else f'target ~{target_rows:,} rows'}")
     log(f"Zero-day hold-out families: {sorted(zero_day)}")
 
     csv_files = sorted(glob.glob(str(raw_dir / "*.csv")))
@@ -150,85 +125,115 @@ def main():
         log(f"[!] No CSVs in {raw_dir}")
         log.close(); sys.exit(1)
 
-    # ---- 1-4. Clean each file ------------------------------------------
-    log(f"\n[1] CLEANING {len(csv_files)} FILES")
+    # ---- Pass 1: total row count -> global sampling fraction -----------
+    log(f"\n[1] COUNTING ROWS ({len(csv_files)} files)")
     log("-" * 70)
-    frames = []
+    total = 0
     for f in csv_files:
-        df, _ = clean_one_file(f, label_col, drop_label_values, leakage_cols, log)
-        frames.append(df)
+        n = count_rows(f)
+        total += n
+        log(f"    {os.path.basename(f):20s} {n:>12,} rows")
+    log(f"    {'TOTAL':20s} {total:>12,} rows")
 
-    # Align on common columns, then concat.
-    common = set(frames[0].columns)
-    for fr in frames[1:]:
-        common &= set(fr.columns)
-    common = [c for c in frames[0].columns if c in common]
-    data = pd.concat([fr[common] for fr in frames], ignore_index=True)
-    log(f"\n    Combined: {data.shape[0]:,} rows x {data.shape[1]-1} features")
+    if args.full:
+        keep_frac = 1.0
+    else:
+        # Keep a bit extra; zero-day rows are kept in full regardless.
+        keep_frac = min(1.0, target_rows / max(total, 1))
+    log(f"    Sampling fraction for non-zero-day rows: {keep_frac:.4f}")
 
-    # ---- 5. Drop duplicates --------------------------------------------
+    # ---- Pass 2: chunked read + sample ---------------------------------
+    log(f"\n[2] STREAMING + CLEANING (chunksize {args.chunksize:,})")
+    log("-" * 70)
+    kept = []           # list of small DataFrames
+    seen_leak = set()
+    for f in csv_files:
+        file_kept = 0
+        for chunk in pd.read_csv(f, chunksize=args.chunksize,
+                                 low_memory=False, encoding="latin-1"):
+            chunk.columns = [c.strip() for c in chunk.columns]
+            # drop stray header rows
+            if label_col in chunk.columns:
+                chunk = chunk[~chunk[label_col].astype(str).str.strip()
+                              .isin(drop_label_values)]
+            if chunk.empty:
+                continue
+            # drop leakage columns
+            present_leak = [c for c in chunk.columns if c in leakage_cols]
+            seen_leak.update(present_leak)
+            chunk = chunk.drop(columns=present_leak)
+            # split label / numeric features
+            lab = chunk[label_col].astype(str).str.strip()
+            feats = (chunk.drop(columns=[label_col])
+                     .apply(pd.to_numeric, errors="coerce")
+                     .replace([np.inf, -np.inf], np.nan))
+            feats[label_col] = lab.values
+            # keep ALL zero-day rows; sample the rest
+            is_zero = feats[label_col].isin(zero_day)
+            zero_part = feats[is_zero]
+            rest = feats[~is_zero]
+            if keep_frac < 1.0 and len(rest):
+                mask = rng.random(len(rest)) < keep_frac
+                rest = rest[mask]
+            piece = pd.concat([zero_part, rest], ignore_index=True)
+            if len(piece):
+                kept.append(piece)
+                file_kept += len(piece)
+        log(f"    {os.path.basename(f):20s} kept {file_kept:>9,} rows")
+
+    data = pd.concat(kept, ignore_index=True)
+    del kept
+    log(f"\n    Collected sample: {data.shape[0]:,} rows x {data.shape[1]-1} features")
+    if seen_leak:
+        log(f"    Leakage columns dropped: {sorted(seen_leak)}")
+
+    # ---- 4. Dedup + impute ---------------------------------------------
     if do_dedup:
         before = len(data)
         data = data.drop_duplicates().reset_index(drop=True)
-        log(f"[2] Dropped {before-len(data):,} duplicate rows -> {len(data):,} remain")
+        log(f"[3] Dropped {before-len(data):,} duplicates -> {len(data):,} rows")
 
-    # ---- Handle residual NaNs (from inf or parse) ----------------------
     feat_cols = [c for c in data.columns if c != label_col]
-    nan_rows = data[feat_cols].isna().any(axis=1).sum()
+    nan_rows = int(data[feat_cols].isna().any(axis=1).sum())
     if nan_rows:
-        # Median-impute (robust); alternative is to drop. Median keeps rows.
-        medians = data[feat_cols].median(numeric_only=True)
-        data[feat_cols] = data[feat_cols].fillna(medians)
-        log(f"[3] Imputed NaNs in {nan_rows:,} rows with column medians")
+        data[feat_cols] = data[feat_cols].fillna(data[feat_cols].median(numeric_only=True))
+        log(f"[4] Imputed NaNs in {nan_rows:,} rows with column medians")
 
-    # ---- 6. Labels: family + binary ------------------------------------
+    # ---- 5. Labels ------------------------------------------------------
     data[label_col] = data[label_col].astype(str).str.strip()
-    data["binary_label"] = (data[label_col] != benign).astype(int)  # 1 = attack
+    data["binary_label"] = (data[label_col] != benign).astype(int)
 
-    # ---- 7. Zero-day hold-out ------------------------------------------
+    # ---- 6. Zero-day split ---------------------------------------------
     is_zero = data[label_col].isin(zero_day)
     zeroday = data[is_zero].copy()
     main_data = data[~is_zero].copy()
-    log(f"\n[4] Zero-day hold-out: {len(zeroday):,} rows "
-        f"({', '.join(sorted(zero_day))}) set aside")
+    log(f"\n[5] Zero-day hold-out: {len(zeroday):,} rows set aside")
     log(f"    Remaining for train/test: {len(main_data):,} rows")
 
-    # ---- 8. Stratified subsample ---------------------------------------
-    if use_subset and len(main_data) > subset_rows:
-        # stratify on family label so rare classes survive
-        frac = subset_rows / len(main_data)
-        main_data = (main_data
-                     .groupby(label_col, group_keys=False)
-                     .apply(lambda g: g.sample(frac=frac, random_state=seed)))
-        main_data = main_data.reset_index(drop=True)
-        log(f"[5] Stratified subsample -> {len(main_data):,} rows")
-
-    # ---- 9. Train/test split (stratified on binary) --------------------
-    feat_cols = [c for c in main_data.columns
-                 if c not in (label_col, "binary_label")]
+    # ---- 7. Train/test split -------------------------------------------
+    feat_cols = [c for c in main_data.columns if c not in (label_col, "binary_label")]
     X = main_data[feat_cols]
-    y = main_data[[label_col, "binary_label"]]
+    strat = main_data["binary_label"] if main_data["binary_label"].nunique() > 1 else None
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, random_state=seed,
-        stratify=main_data["binary_label"])
+        X, main_data[[label_col, "binary_label"]],
+        test_size=test_size, random_state=seed, stratify=strat)
     log(f"[6] Split: train {len(X_tr):,} | test {len(X_te):,}")
 
-    # ---- 10. Scale (fit on TRAIN only) ---------------------------------
+    # ---- 8. Scale (fit on train only) ----------------------------------
     scaler = StandardScaler()
-    X_tr_s = pd.DataFrame(scaler.fit_transform(X_tr), columns=feat_cols, index=X_tr.index)
-    X_te_s = pd.DataFrame(scaler.transform(X_te), columns=feat_cols, index=X_te.index)
-    Xz = zeroday[feat_cols]
-    Xz_s = pd.DataFrame(scaler.transform(Xz), columns=feat_cols, index=zeroday.index)
-    yz = zeroday[[label_col, "binary_label"]]
-    log(f"[7] Scaled features (StandardScaler fit on train only — no leakage)")
+    X_tr_s = pd.DataFrame(scaler.fit_transform(X_tr), columns=feat_cols)
+    X_te_s = pd.DataFrame(scaler.transform(X_te), columns=feat_cols)
+    Xz_s = pd.DataFrame(scaler.transform(zeroday[feat_cols]), columns=feat_cols)
+    log(f"[7] Scaled (StandardScaler fit on train only — no leakage)")
 
-    # ---- 11. Save -------------------------------------------------------
+    # ---- 9. Save --------------------------------------------------------
     X_tr_s.to_csv(proc_dir / "X_train.csv", index=False)
     X_te_s.to_csv(proc_dir / "X_test.csv", index=False)
     Xz_s.to_csv(proc_dir / "X_zeroday.csv", index=False)
-    y_tr.to_csv(proc_dir / "y_train.csv", index=False)
-    y_te.to_csv(proc_dir / "y_test.csv", index=False)
-    yz.to_csv(proc_dir / "y_zeroday.csv", index=False)
+    y_tr.reset_index(drop=True).to_csv(proc_dir / "y_train.csv", index=False)
+    y_te.reset_index(drop=True).to_csv(proc_dir / "y_test.csv", index=False)
+    zeroday[[label_col, "binary_label"]].reset_index(drop=True).to_csv(
+        proc_dir / "y_zeroday.csv", index=False)
     joblib.dump(scaler, proc_dir / "scaler.joblib")
     with open(proc_dir / "feature_columns.json", "w") as fh:
         json.dump(feat_cols, fh, indent=2)
@@ -236,14 +241,13 @@ def main():
     # ---- Summary --------------------------------------------------------
     log(f"\n[8] SAVED TO {proc_dir}")
     log("-" * 70)
-    def dist(yframe, name):
-        b = int((yframe['binary_label'] == 0).sum())
-        a = int((yframe['binary_label'] == 1).sum())
-        log(f"    {name:10s} {len(yframe):>9,} rows  |  benign {b:>8,}  attack {a:>8,}")
-    dist(y_tr, "train"); dist(y_te, "test"); dist(yz, "zero-day")
+    def dist(yf, name):
+        b = int((yf['binary_label'] == 0).sum()); a = int((yf['binary_label'] == 1).sum())
+        log(f"    {name:10s} {len(yf):>9,} rows  |  benign {b:>8,}  attack {a:>8,}")
+    dist(y_tr, "train"); dist(y_te, "test")
+    dist(zeroday[[label_col, 'binary_label']], "zero-day")
     log(f"    features: {len(feat_cols)}")
-    log(f"\n    For autoencoders: train on benign rows of X_train only")
-    log(f"      (y_train.binary_label == 0).")
+    log(f"\n    Autoencoders: train on benign rows only (y_train.binary_label == 0).")
     log(f"    Report: {results_dir/'preprocessing_report.txt'}")
     log("=" * 70)
     log.close()
