@@ -160,5 +160,59 @@ matched FPR ≈ 0.10** (table above), which is the fair, security-meaningful res
 
 ---
 
-*H1 supported: the LSTM-Autoencoder roughly doubles zero-day detection at matched
-FPR. Remaining: latency profiling (H2) and explainability (SHAP) — then write-up.*
+## 4. Explainability — threat attribution — 3 Nov 2026
+
+Two complementary techniques (`src/explainability.py`), applied to the flagged
+attack flows (2,478 true-positive flows explained). Both turn the opaque anomaly
+score into an interpretable attack attribution.
+
+### Reconstruction-error feature ranking (autoencoder-native — primary)
+
+Top features driving anomalies (mean per-feature reconstruction error over
+flagged flows):
+
+| Rank | Feature | Mean recon-error |
+|---|---|---|
+| 1 | Subflow Fwd Pkts | 22.03 |
+| 2 | Fwd Header Len | 21.73 |
+| 3 | Tot Fwd Pkts | 21.22 |
+| 4 | TotLen Fwd Pkts | 20.73 |
+| 5 | Subflow Fwd Byts | 20.69 |
+| 6 | Fwd Act Data Pkts | 20.65 |
+| 7 | Flow Byts/s | 13.06 |
+| 8 | Bwd Pkts/s | 6.62 |
+
+**Interpretation:** attacks are driven mainly by **forward-direction volume**
+(packet/byte counts, header length, flow byte-rate) — the classic signature of
+**DoS/DDoS and brute-force flooding**, consistent with the dominant attack
+families in the data.
+
+### SHAP attribution (literature-standard — corroborating)
+
+Top features by mean |SHAP value|: Fwd Seg Size Min, Init Fwd Win Byts,
+Bwd IAT Mean/Std, Bwd Pkt Len Min, and TCP flag counts (ACK, RST, PSH, URG).
+
+**Interpretation:** SHAP surfaces **connection-setup and TCP-control** anomalies —
+initial window size, backward inter-arrival timing, and flag behaviour — the
+signature of **scanning and protocol-level abuse**.
+
+### Why this matters (for the write-up)
+
+The two methods are complementary, not contradictory:
+- **Reconstruction error → magnitude anomalies** (volume): likely DoS / brute-force.
+- **SHAP → structural anomalies** (flags, timing, window size): likely scanning /
+  protocol abuse.
+
+Together they give an analyst a real **threat-attribution signal** — not just
+"this is anomalous" but *in what way* it is anomalous, pointing toward the attack
+type. This directly satisfies the explainable-AI / threat-attribution requirement.
+
+**Deliverable:** `results/explain_feature_ranking.csv` — per-flow top-3
+responsible features for every flagged attack flow (analyst-readable).
+Figures: `explain_global_importance.png`, `shap_summary.png`.
+
+---
+
+*Status: H1 supported (LSTM doubles zero-day detection at matched FPR);
+explainability delivered (threat attribution via reconstruction ranking + SHAP).
+Remaining: latency profiling (H2), then write-up.*
