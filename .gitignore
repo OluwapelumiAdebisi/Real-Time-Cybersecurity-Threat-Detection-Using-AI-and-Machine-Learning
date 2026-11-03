@@ -26,3 +26,7 @@ env/
 
 # Results are kept, but ignore scratch
 results/scratch/
+
+processed_data.zip
+processed_data/
+*.Rhistory
